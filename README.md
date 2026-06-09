@@ -1,105 +1,129 @@
 Lenovo AI Now Removal Script
 ============================
 
-This repository contains PowerShell scripts to detect and remove "Lenovo AI Now" a vendor-installed application often considered bloatware on Lenovo devices. These scripts are designed primarily for use with Microsoft Intune Remediation scripts, but can be adapted to other deployment tools.
+PowerShell scripts to detect and remove **Lenovo AI Now** — an OEM-installed application bundled on recent Lenovo devices that many organisations treat as bloatware. Designed for **Microsoft Intune Proactive Remediation**, though the scripts can be adapted to other SYSTEM-context deployment tools.
 
-Contents
---------
+> **Note**: This is a substantially rewritten fork of the upstream
+> [`nullifyac/Lenovo-AI-Now-Script-Uninstall`](https://github.com/nullifyac/Lenovo-AI-Now-Script-Uninstall).
+> See "What this fork changes" below for the reasoning.
 
-- **detect.ps1**  
-  A detection script that checks whether Lenovo AI Now is currently installed.  
-  - Exits **1** if Lenovo AI Now is found in uninstall registry entries, common install paths, or running services/processes.  
-  - Exits **0** if Lenovo AI Now is not detected.
+Why removal is non-trivial
+--------------------------
 
-- **remediate.ps1**  
-  The remediation (removal) script that:
-  1. Checks if Lenovo AI Now is present (if not, exits successfully).
-  2. If present, performs comprehensive cleanup: stops services/processes, removes program files, cleans registry entries, removes shortcuts, unregisters shell extensions, and removes scheduled tasks.
-  3. **Cleanup Logic:**  
-     - Leverages multiple functions for stubborn files: ownership changes (takeown/icacls), robocopy mirror deletion, Explorer downtime windows, and scheduling deletions for reboot when necessary.
-     - Performs final verification and returns appropriate exit codes.
-  4. **Exit Codes:**  
-     - **0**: Complete success, all components removed.  
-     - **3010**: Success, reboot recommended (locked files scheduled for deletion).  
-     - **1603**: Partial failure, some residual components remain.  
-     - **1**: Unhandled error during remediation.
+Lenovo AI Now installs two shell-extension DLLs (`AINppShell.dll` and `OverlayIcon.dll`) that are loaded by virtually every shell-using GUI process on the machine — File Explorer, Office apps, browsers, anything that opens a common file dialog. The DLLs cannot be deleted in-session because the OS marks them as in-use across many processes. Killing Explorer doesn't help: Windows auto-restarts it within ~1 second (`AutoRestartShell`), and the DLLs are still held by all the non-Explorer consumers. The reliable cleanup path is to schedule the locked files via `PendingFileRenameOperations` and let SMSS delete them at the next boot, before any shell process starts.
 
-How It Works
+The scripts also handle the **MSIX/AppX** side (`AINowContextWIN11`, the Win11 context-menu extension), the **full COM registration surface** (3 CLSIDs + AppID + TypeLib + 2 ProgIDs + 10 shellex handler subkeys + `ShellIconOverlayIdentifiers` entry + `Shell Extensions\Approved` value), the **per-user repository stubs** that Microsoft's `Remove-AppxPackage` leaves behind, and **multi-user machines** (enumerates HKEY_USERS by SID).
+
+Two-phase model
+---------------
+
+| Phase | When it runs | What it does | Exit code |
+|---|---|---|---|
+| **Phase A** | First Intune Proactive Remediation cycle | Cleans services, processes, AppX package, AppX repository stubs, shell extension surface, user data, shortcuts, scheduled tasks. Removes the install directory if possible; queues locked files via PFRO if not. Writes a sentinel so detect doesn't loop. | **3010** (Intune reports 0 / success) |
+| **Phase B** | After the user's organic reboot, next detect cycle | Verifies install directory is gone, removes any AppX repository stubs that resurfaced, confirms clean state. | **0** |
+
+Between Phase A and the user's reboot, `detect.ps1` reads the sentinel and short-circuits to **exit 0**, so Intune won't keep firing remediate (which would bloat `PendingFileRenameOperations`).
+
+Exit code semantics
+-------------------
+
+`remediate.ps1` distinguishes its internal result from the Intune-reported code:
+
+| Internal | Intune | Meaning |
+|---|---|---|
+| 0 | 0 | Clean removal, no reboot needed |
+| 3010 | 0 | Phase A complete, reboot pending. Reported as success so Intune doesn't re-trigger before the user reboots |
+| 1603 | 1 | Partial failure — residuals remain and PFRO queue failed |
+| 1 | 1 | Unhandled exception |
+
+Requirements
 ------------
 
-1. **Detection**  
-   - In Intune, run **detect.ps1** as the detection script.  
-   - Checks uninstall registry keys (32-bit and 64-bit), common Lenovo install paths, and running services/processes matching Lenovo AI Now patterns.
-   - If it exits **1**, Lenovo AI Now is present; if it exits **0**, Lenovo AI Now is not present.
+- **Run script in 64-bit PowerShell** must be **Yes** in the Intune PR settings.
+  - Reason: Intune defaults Proactive Remediation scripts to 32-bit PowerShell, which silently redirects `HKLM:\SOFTWARE\Classes\CLSID` reads to the `Wow6432Node` hive. All of Lenovo AI Now's CLSIDs and uninstall registry entry live in the **64-bit** hive, so a 32-bit script reads an empty view and cleans nothing.
+  - Both scripts include a self-relaunch guard that re-invokes them under `C:\Windows\SysNative\WindowsPowerShell\v1.0\powershell.exe` if Intune started them 32-bit. The toggle is still recommended (saves one process spawn per cycle).
+- **Targeting**: assign the PR script to Lenovo devices only. A device filter on `Manufacturer -eq "LENOVO"` is reasonable.
+- **Schedule**: daily detection is fine; the default 8-hour cadence is fine too. The sentinel prevents detection-loop bloat between Phase A and reboot.
 
-2. **Remediation / Removal**  
-   - When Lenovo AI Now is present, run **remediate.ps1**:
-     1. Enumerates uninstall entries and install paths.
-     2. Stops related services and processes.
-     3. Attempts vendor uninstaller if non-interactive command available (prefers manual cleanup).
-     4. Removes program files, user data, and shortcuts using escalated removal techniques.
-     5. Cleans registry keys, scheduled tasks, and shell extension registrations.
-     6. Re-checks for residuals and reports final status.
+Deployment
+----------
 
-Deployment Scenarios
---------------------
-
-**Intune (Platform Scripts - Recommended)**
-
-- Upload **detect.ps1** as the Detection Script.  
-- Upload **remediate.ps1** as the Remediation Script.  
-- Both run under SYSTEM context by default.
-- If detect.ps1 exits 1, Intune triggers remediate.ps1.
-
-**Win32 App (Untested)**
-
-- Can be packaged as a Win32 app for pre-provisioned devices.
-- **Warning**: Win32 deployment is untested test thoroughly in a pilot environment first.
+1. In the Intune admin centre, go to **Devices → Scripts and remediations → Platform scripts (Proactive Remediations)**.
+2. Create a new script package:
+   - **Detection script**: `detect.ps1`
+   - **Remediation script**: `remediate.ps1`
+   - **Run script as logged-on user**: No (run as SYSTEM)
+   - **Enforce script signature check**: No
+   - **Run script in 64-bit PowerShell**: **Yes** (important — see Requirements)
+3. Assign to a Lenovo-only device group.
 
 Files
 -----
 
-| File           | Description                                                                                           |
-|----------------|-------------------------------------------------------------------------------------------------------|
-| detect.ps1     | Checks registry, install paths, and running services/processes. Exits 1 if found, 0 if not.        |
-| remediate.ps1  | Full removal script that performs comprehensive cleanup with escalated removal techniques.           |
-| README.md      | This documentation.                                                                                   |
+| File | Description |
+|---|---|
+| `detect.ps1` | Detection: registry, install paths, processes, services, AppX packages, AppX repository stubs, sentinel suppression. Exits 1 on any find. |
+| `remediate.ps1` | Full removal: two-phase model, COM surface cleanup, MSIX removal, PFRO queue for locked files, sentinel write. |
+| `tools/diagnose_clsid_walk.ps1` | Optional read-only diagnostic that times the CLSID hive walk via PowerShell cmdlets vs the .NET registry API. Useful when investigating registry-walk performance on a specific device. |
+| `README.md` | This file. |
+| `CLAUDE.md` | Design contract for the repo (escalation ladder, exit code mapping, per-user cleanup approach). |
 
-Logs & Troubleshooting
+Logs & troubleshooting
 ----------------------
 
-**Log Location:**  
-`C:\ProgramData\Microsoft\IntuneManagementExtension\Logs`
+**Log path**: `C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\Lenovo_AI_Now_Remediate.log`
 
-**Log Files:**
+(The detect script writes to Intune's standard PR stdout capture, not a separate log file. Use the Intune console or `AgentExecutor.log` for detection output.)
 
-- `Lenovo_AI_Now_Detect.log`  
-- `Lenovo_AI_Now_Remediate.log` 
+**Common scenarios:**
 
-**Common Scenarios:**
+- **Exit 3010 (Phase A complete, reboot pending)**: expected on first run for any device with the install dir still present. User reboots, PFRO clears the install dir at next boot, next detect cycle exits 0.
+- **Exit 1603 (partial failure)**: residuals remain AND the PFRO queue write failed. Check the log for `Failed to write PendingFileRenameOperations`. Rare; usually indicates registry write protection (e.g., very aggressive ASR/EDR policy).
+- **Exit 1 (unhandled exception)**: check the log for `REMEDIATION FAILED: Unhandled exception` and the position message that follows.
+- **Detect keeps triggering remediate with no observed cleanup**: the device may not be receiving the latest script version. Verify with `Get-ChildItem 'C:\Windows\IMECache\HealthScripts\<guid>_*' -Directory` and check the highest-numbered cache version is current.
 
-1. **Exit Code 3010 (Reboot Recommended)**  
-   - Some files were locked and scheduled for deletion on reboot.
-   - Reboot the device to complete cleanup.
+**MDE Advanced Hunting queries** (useful for monitoring fleet rollout):
 
-2. **Exit Code 1603 (Partial Failure)**  
-   - Check remediation log for WARNING/ERROR entries about residual files or registry keys.
-   - May require manual cleanup or additional remediation attempts.
+```kql
+// Devices in Phase A (sentinel set, waiting for reboot)
+DeviceRegistryEvents
+| where Timestamp > ago(14d)
+| where RegistryKey has @"SOFTWARE\LenovoAINowRemediation"
+| where RegistryValueName == "PhaseAComplete"
+| where ActionType == "RegistryValueSet"
+| summarize PhaseAAt = max(Timestamp) by DeviceName, DeviceId
+| extend HoursSincePhaseA = datetime_diff('hour', now(), PhaseAAt)
+```
 
-3. **Stubborn Components**  
-   - The script uses multiple techniques including Explorer downtime and file locking workarounds.
-   - For persistent issues, check the log for specific files/registry keys that couldn't be removed.
+```kql
+// Cleanup progress: should trend to zero as devices reboot
+DeviceImageLoadEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("AINppShell.dll", "OverlayIcon.dll")
+| summarize Loads = count(), Devices = dcount(DeviceId) by FileName
+```
 
-Notes & Tips
-------------
+What this fork changes
+----------------------
 
-1. **SYSTEM Context**  
-   - Scripts are designed to run under SYSTEM context (standard for Intune platform scripts).
+The upstream version tries to delete files in-session and uses an Explorer-kill window plus a "schedule ≤5 locked files for reboot delete" fallback. In production this loses against `AutoRestartShell` and against the 17+ non-Explorer processes that also hold the DLLs, so most devices end up with 270 residual files and no PFRO queue. Notable changes in this fork:
 
-2. **Manual vs. Vendor Cleanup**  
-   - Scripts perform manual cleanup rather than relying on interactive vendor uninstallers.
+- **Pivot to PFRO + reboot as the primary path** for the install directory. Drop the Explorer-kill block and the ≤5-file PFRO gate.
+- **Self-relaunch under 64-bit PowerShell** so the script sees the correct registry hive.
+- **Full mapping of the COM registration surface**: hardcodes the 3 confirmed CLSIDs + AppID + TypeLib + 2 ProgIDs + 10 shellex handler subkeys; also walks both 64-bit and `Wow6432Node` CLSID hives dynamically via the .NET registry API (`Microsoft.Win32.Registry`), which is ~200× faster than `Get-ChildItem` on registry paths.
+- **MSIX/AppX handling**: `Remove-AppxPackage -AllUsers` for `AINowContextWIN11`, plus `Remove-AppxProvisionedPackage -Online`, plus explicit cleanup of the orphaned per-user repository stubs at `HKU\<sid>\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages` and the HKLM `AppxAllUserStore` mirrors. Microsoft's removal leaves these behind.
+- **Service disable-before-stop** sequence (`sc config start= disabled` → `Stop-Service` → `WaitForStatus('Stopped', 30s)` → `sc delete`) to prevent auto-restart races.
+- **Wildcard match for the uninstall DisplayName** — the upstream regex `^Lenovo AI Now\b` silently didn't match the actual `Lenovo AI Now 1.3` entry on observed devices.
+- **`-LiteralPath` for registry paths containing literal `*`** — the upstream used `-Path`, which expanded `*` as a wildcard across every HKCR subkey and could hang for minutes.
+- **Sentinel + suppression** in detect to prevent retrigger between Phase A and reboot.
+- **Removed dead code** (`Invoke-Uninstaller`, `Invoke-MsiUninstall`) and the robocopy fallback (which can deadlock against kernel-locked DLLs).
 
-3. **Testing**  
-   - Test in a pilot environment before broad deployment.
-   - Monitor logs for any unexpected behavior or residual components.
+Validated on two real Lenovo devices: one starting from full fresh-install state (exercised the PFRO + reboot path), one in mid-cleanup state (exercised direct deletion after natural reboot). Both reached exit 0.
 
+Caveats
+-------
+
+- The scripts do not handle Lenovo Vantage / Commercial Vantage re-pushing AI Now after removal. If your fleet has a Vantage policy that re-installs the app, a separate Vantage policy change is needed.
+- "Lenovo AI Solution", "Lenovo AI Meeting Manager", and other Lenovo AI-family apps are **out of scope**. The scripts match specifically on `*Lenovo AI Now*` and the known CLSIDs.
+- Win32 app deployment is untested. Test thoroughly in a pilot environment first.
+- Tested against Lenovo AI Now version 1.3 only. Future versions with different CLSIDs would still be caught by the dynamic walk (matched by DLL filename + parent path containing `\Lenovo\Lenovo AI\`), but new DLL filenames would need the script's `$lenovoAIDllFileNames` list extended.
