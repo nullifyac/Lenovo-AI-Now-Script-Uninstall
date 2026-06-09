@@ -364,8 +364,8 @@ function Add-PendingFileDeleteBatch {
     # Directories must come AFTER their contents (bottom-up); SMSS won't
     # delete a non-empty directory.
     param(
-        [Parameter(Mandatory)][string[]]$FilePaths,
-        [Parameter(Mandatory)][string[]]$DirectoryPaths   # already ordered bottom-up
+        [string[]]$FilePaths = @(),
+        [string[]]$DirectoryPaths = @()   # already ordered bottom-up
     )
 
     $regPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
@@ -419,7 +419,7 @@ function Add-PendingFileDeleteBatch {
 
     $combined = @($existing) + $newEntries.ToArray()
     try {
-        Set-ItemProperty -Path $regPath -Name $regName -Value $combined -Type MultiString -Force -ErrorAction Stop
+        New-ItemProperty -Path $regPath -Name $regName -Value ([string[]]$combined) -PropertyType MultiString -Force -ErrorAction Stop | Out-Null
         Write-Log "Queued $added items in PendingFileRenameOperations (total: $($combined.Count / 2) entries)."
         return $added
     } catch {
@@ -466,7 +466,7 @@ function Set-PhaseACompleteSentinel {
             New-Item -Path $sentinelKey -Force -ErrorAction Stop | Out-Null
         }
         $stamp = (Get-Date).ToUniversalTime().ToString('o')
-        Set-ItemProperty -Path $sentinelKey -Name $sentinelValueName -Value $stamp -Type String -Force
+        New-ItemProperty -Path $sentinelKey -Name $sentinelValueName -Value $stamp -PropertyType String -Force -ErrorAction Stop | Out-Null
         Write-Log "Phase A sentinel written: $stamp"
     } catch {
         Write-Log "Failed to write Phase A sentinel: $($_.Exception.Message)" "WARNING"
@@ -481,6 +481,24 @@ function Clear-PhaseACompleteSentinel {
         }
     } catch {
         Write-Log "Failed to clear Phase A sentinel: $($_.Exception.Message)" "DEBUG"
+    }
+}
+
+function Remove-RegistryValueIfPresent {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if (-not (Test-Path -Path $Path)) { return }
+    try {
+        $key = Get-Item -Path $Path -ErrorAction Stop
+        if ($key.GetValueNames() -contains $Name) {
+            Write-Log "Removing registry value $Name from $Path"
+            Remove-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+        }
+    } catch {
+        Write-Log "Failed to remove registry value $Name from $Path : $($_.Exception.Message)"
     }
 }
 
@@ -556,9 +574,7 @@ function Remove-UserData {
         if ($userSid) {
             $userRegPaths = @(
                 "Registry::HKEY_USERS\$userSid\SOFTWARE\Lenovo\AI Now",
-                "Registry::HKEY_USERS\$userSid\SOFTWARE\Lenovo\Lenovo AI Now",
-                "Registry::HKEY_USERS\$userSid\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\Lenovo AI Now",
-                "Registry::HKEY_USERS\$userSid\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\LenovoAINow"
+                "Registry::HKEY_USERS\$userSid\SOFTWARE\Lenovo\Lenovo AI Now"
             )
             foreach ($regPath in $userRegPaths) {
                 if (Test-Path -Path $regPath) {
@@ -569,6 +585,11 @@ function Remove-UserData {
                         Write-Log "Failed to remove user registry key $regPath : $($_.Exception.Message)"
                     }
                 }
+            }
+
+            $userRunKey = "Registry::HKEY_USERS\$userSid\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+            foreach ($runValue in @('Lenovo AI Now', 'LenovoAINow')) {
+                Remove-RegistryValueIfPresent -Path $userRunKey -Name $runValue
             }
         } else {
             Write-Log "Could not resolve SID for user $($userProfile.Name) at $profilePath" "DEBUG"
@@ -758,14 +779,25 @@ function Remove-ScheduledTasks {
         $tasks = $tasks | Select-Object -Unique
         foreach ($task in $tasks) {
             try {
-                Write-Log "Removing scheduled task: $($task.TaskName)"
-                Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction Stop
+                Write-Log "Removing scheduled task: $($task.TaskPath)$($task.TaskName)"
+                Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$false -ErrorAction Stop
             } catch {
-                Write-Log "Failed to remove scheduled task $($task.TaskName): $($_.Exception.Message)"
+                Write-Log "Failed to remove scheduled task $($task.TaskPath)$($task.TaskName): $($_.Exception.Message)"
             }
         }
     } catch {
         Write-Log "Error enumerating scheduled tasks: $($_.Exception.Message)"
+    }
+}
+
+function Get-RegistryDefaultValue {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    try {
+        $key = Get-Item -LiteralPath $LiteralPath -ErrorAction Stop
+        return $key.GetValue($null)
+    } catch {
+        return $null
     }
 }
 
@@ -867,7 +899,7 @@ function Unregister-LenovoAIShellExtensions {
             try {
                 $clsidValue = $null
                 try {
-                    $clsidValue = Get-ItemPropertyValue -Path $entry.PSPath -Name '(default)' -ErrorAction Stop
+                    $clsidValue = Get-RegistryDefaultValue -LiteralPath $entry.PSPath
                 } catch { }
                 $nameLooksLenovo = ($entry.PSChildName -match '(?i)lenovo' -or $entry.PSChildName -match '(?i)ainow')
                 if (($clsidValue -and $allClsids.Contains($clsidValue)) -or $nameLooksLenovo) {
@@ -928,7 +960,7 @@ function Unregister-LenovoAIShellExtensions {
                 try {
                     $clsidValue = $null
                     try {
-                        $clsidValue = Get-ItemPropertyValue -LiteralPath $entry.PSPath -Name '(default)' -ErrorAction Stop
+                        $clsidValue = Get-RegistryDefaultValue -LiteralPath $entry.PSPath
                     } catch { }
                     if ($clsidValue -and $allClsids.Contains($clsidValue)) {
                         Write-Log "Removing shellex handler $($entry.PSPath) -> $clsidValue"
@@ -1036,11 +1068,18 @@ function Invoke-LenovoAiNowRemediation {
         'HKLM:\SOFTWARE\Lenovo\AI Now',
         'HKLM:\SOFTWARE\Lenovo\Lenovo AI Now',
         'HKLM:\SOFTWARE\WOW6432Node\Lenovo\AI Now',
-        'HKLM:\SOFTWARE\WOW6432Node\Lenovo\Lenovo AI Now',
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\Lenovo AI Now',
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\LenovoAINow'
+        'HKLM:\SOFTWARE\WOW6432Node\Lenovo\Lenovo AI Now'
     )
     $registryPaths = $registryPaths | Where-Object { $_ } | Select-Object -Unique
+
+    foreach ($runRoot in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'
+    )) {
+        foreach ($runValue in @('Lenovo AI Now', 'LenovoAINow')) {
+            Remove-RegistryValueIfPresent -Path $runRoot -Name $runValue
+        }
+    }
 
     Remove-Residuals -InstallPaths $installPaths -RegistryPaths $registryPaths
 
