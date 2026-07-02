@@ -3,10 +3,13 @@
 # Two-phase model:
 #   Phase A -- clean what can be cleaned in-session (services, processes,
 #             user data, shortcuts, uninstall reg entry, shell-extension
-#             registrations, AppX/MSIX package). Queue any locked install-
-#             dir files for boot-time deletion via PendingFileRenameOperations.
-#             Write a sentinel so detect.ps1 can suppress retrigger until
-#             the user reboots. Exit 3010, Intune treats as success.
+#             registrations, AppX/MSIX package). First attempt Lenovo's
+#             vendor uninstaller with its typoed silent switch
+#             "SlientUninstall"; then continue manual cleanup regardless.
+#             Queue any locked install-dir files for boot-time deletion via
+#             PendingFileRenameOperations. Write a sentinel so detect.ps1 can
+#             suppress retrigger until the user reboots. Exit 3010, Intune
+#             treats as success.
 #   Phase B -- after user reboots, SMSS processes PFRO, install dir is gone,
 #             detect re-fires clean, exit 0.
 #
@@ -153,6 +156,84 @@ function Get-LenovoAiNowEntries {
             $_.PSObject.Properties['DisplayName'] -and
             $_.DisplayName -like $targetDisplayNamePattern
         }
+}
+
+function Get-ExecutablePathFromCommandLine {
+    param([string]$CommandLine)
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $null }
+
+    $trimmed = $CommandLine.Trim()
+    if ($trimmed -match '^\s*"(?<path>[^"]+)"') {
+        return $matches.path
+    }
+
+    if ($trimmed -match '^\s*(?<path>.+?\.exe)\b') {
+        return $matches.path.Trim('"')
+    }
+
+    return ($trimmed -split '\s+', 2)[0]
+}
+
+function Get-LenovoAiNowVendorUninstallers {
+    param(
+        [object[]]$Entries,
+        [string[]]$InstallPaths
+    )
+
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $uninstallers = New-Object System.Collections.Generic.List[string]
+
+    foreach ($entry in @($Entries)) {
+        foreach ($propertyName in @('QuietUninstallString', 'UninstallString')) {
+            if (-not $entry.PSObject.Properties[$propertyName]) { continue }
+
+            $exePath = Get-ExecutablePathFromCommandLine -CommandLine $entry.$propertyName
+            if (-not $exePath) { continue }
+            if (-not (Test-Path -LiteralPath $exePath)) { continue }
+            if ($seen.Add($exePath)) { $uninstallers.Add($exePath) | Out-Null }
+        }
+    }
+
+    foreach ($installPath in @($InstallPaths)) {
+        if (-not $installPath) { continue }
+        $candidate = Join-Path -Path $installPath -ChildPath 'Lenovo AINow Uninstall.exe'
+        if (-not (Test-Path -LiteralPath $candidate)) { continue }
+        if ($seen.Add($candidate)) { $uninstallers.Add($candidate) | Out-Null }
+    }
+
+    return $uninstallers.ToArray()
+}
+
+function Invoke-LenovoAiNowVendorUninstall {
+    param(
+        [object[]]$Entries,
+        [string[]]$InstallPaths,
+        [int]$TimeoutSeconds = 180
+    )
+
+    $uninstallers = @(Get-LenovoAiNowVendorUninstallers -Entries $Entries -InstallPaths $InstallPaths)
+    if (-not $uninstallers) {
+        Write-Log 'No Lenovo AI Now vendor uninstaller found.' 'DEBUG'
+        return
+    }
+
+    foreach ($uninstaller in $uninstallers) {
+        try {
+            # Lenovo's current silent switch is misspelled by the vendor.
+            Write-Log "Attempting vendor uninstall: `"$uninstaller`" SlientUninstall"
+            $process = Start-Process -FilePath $uninstaller -ArgumentList 'SlientUninstall' -WindowStyle Hidden -PassThru -ErrorAction Stop
+            if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+                Write-Log "Vendor uninstaller timed out after $TimeoutSeconds seconds; terminating PID $($process.Id)." 'WARNING'
+                try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { }
+                continue
+            }
+
+            Write-Log "Vendor uninstaller exited with code $($process.ExitCode)."
+        } catch {
+            Write-Log "Vendor uninstall failed for $uninstaller : $($_.Exception.Message)" 'WARNING'
+        }
+    }
 }
 
 function Stop-ProcessesUnderPaths {
@@ -662,11 +743,31 @@ function Remove-Residuals {
 }
 
 function Remove-LenovoAIServices {
+    param([string[]]$InstallPaths = @())
+
+    $normalizedInstallPaths = @($InstallPaths |
+        Where-Object { $_ } |
+        ForEach-Object { $_.TrimEnd('\') } |
+        Where-Object { $_ })
+
     try {
         $services = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object {
-            $_.Name -match '(?i)lenovo.*ai.*now' -or
-            $_.Name -match '(?i)lenovoai' -or
-            $_.DisplayName -match '(?i)lenovo.*ai.*now'
+            $nameMatch = ($_.Name -match '(?i)AINow|Lenovo.*AI.*Now') -or
+                         ($_.DisplayName -match '(?i)\bLenovo\s+AI\s+Now\b|\bAINow\b')
+
+            $pathMatch = $false
+            if (-not $nameMatch -and $_.PathName -and $normalizedInstallPaths) {
+                $servicePath = $_.PathName.Trim()
+                foreach ($path in $normalizedInstallPaths) {
+                    if ($servicePath.StartsWith($path, [System.StringComparison]::OrdinalIgnoreCase) -or
+                        $servicePath.StartsWith("`"$path", [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $pathMatch = $true
+                        break
+                    }
+                }
+            }
+
+            $nameMatch -or $pathMatch
         })
 
         foreach ($service in $services) {
@@ -684,7 +785,7 @@ function Remove-LenovoAINowAppxPackages {
     # removal so we don't need to kill them manually.
     try {
         $packages = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like '*AINow*' -or $_.Name -like '*LenovoAI*' })
+            Where-Object { $_.Name -match '(?i)AINow|Lenovo.*AI.*Now' })
         foreach ($pkg in $packages) {
             try {
                 Write-Log "Removing AppX package $($pkg.PackageFullName) for all users."
@@ -699,7 +800,10 @@ function Remove-LenovoAINowAppxPackages {
 
     try {
         $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
-            Where-Object { $_.PackageName -like '*AINow*' -or $_.DisplayName -like '*Lenovo*AI*' })
+            Where-Object {
+                $_.PackageName -match '(?i)AINow|Lenovo.*AI.*Now' -or
+                $_.DisplayName -match '(?i)\bLenovo\s+AI\s+Now\b|\bAINow\b'
+            })
         foreach ($pkg in $provisioned) {
             try {
                 Write-Log "Removing provisioned AppX package $($pkg.PackageName)."
@@ -727,7 +831,7 @@ function Remove-LenovoAINowAppxRepositoryStubs {
         $repoPath = "Registry::HKEY_USERS\$userSid\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages"
         if (-not (Test-Path -LiteralPath $repoPath)) { continue }
         foreach ($entry in Get-ChildItem -LiteralPath $repoPath -ErrorAction SilentlyContinue) {
-            if ($entry.PSChildName -like '*AINow*' -or $entry.PSChildName -like '*LenovoAI*') {
+            if ($entry.PSChildName -match '(?i)AINow|Lenovo.*AI.*Now') {
                 try {
                     Write-Log "Removing orphaned per-user AppX repository entry: $($entry.PSChildName) (user: $($userProfile.Name))"
                     Remove-Item -LiteralPath $entry.PSPath -Recurse -Force -ErrorAction Stop
@@ -745,7 +849,7 @@ function Remove-LenovoAINowAppxRepositoryStubs {
     )) {
         if (-not (Test-Path -LiteralPath $root)) { continue }
         foreach ($entry in Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue) {
-            if ($entry.PSChildName -like '*AINow*' -or $entry.PSChildName -like '*LenovoAI*') {
+            if ($entry.PSChildName -match '(?i)AINow|Lenovo.*AI.*Now') {
                 try {
                     Write-Log "Removing orphaned HKLM AppX entry: $($entry.PSPath)"
                     Remove-Item -LiteralPath $entry.PSPath -Recurse -Force -ErrorAction Stop
@@ -761,7 +865,7 @@ function Remove-ScheduledTasks {
     try {
         $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
             $_.TaskName -match '(?i)lenovo.*ai.*now' -or
-            $_.TaskName -match '(?i)lenovoai'
+            $_.TaskName -match '(?i)ainow'
         })
 
         foreach ($task in (Get-ScheduledTask -ErrorAction SilentlyContinue)) {
@@ -1029,22 +1133,27 @@ function Invoke-LenovoAiNowRemediation {
     $appxPresent = $false
     try {
         $appxPresent = $null -ne (Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like '*AINow*' -or $_.Name -like '*LenovoAI*' } |
+            Where-Object { $_.Name -match '(?i)AINow|Lenovo.*AI.*Now' } |
             Select-Object -First 1)
     } catch { }
 
     if (-not $pathExists -and -not $entries -and -not $appxPresent) {
         Write-Log "Lenovo AI Now is already absent from the system."
         # Belt-and-braces: still scrub user-profile leftovers, straggling
-        # shortcuts, and any orphaned AppX repository stubs.
+        # shortcuts, shell-extension registrations, and any orphaned AppX
+        # repository stubs.
+        Unregister-LenovoAIShellExtensions
         Remove-UserData
         Remove-StartMenuShortcuts
+        Remove-ScheduledTasks
         Remove-LenovoAINowAppxRepositoryStubs
         Clear-PhaseACompleteSentinel
         return 0
     }
 
     if ($entries) { Write-Log 'Registry entries detected for Lenovo AI Now.' }
+
+    Invoke-LenovoAiNowVendorUninstall -Entries $entries -InstallPaths $installPaths
 
     # Stop processes (path + executable name) and services across the install
     # paths. Then remove the MSIX (which also terminates any of its own
@@ -1053,7 +1162,7 @@ function Invoke-LenovoAiNowRemediation {
     Stop-ProcessesUnderPaths -Paths $installPaths -ExecutableNames $processExecutables
     Stop-ProcessesUnderPaths -Paths @() -ExecutableNames $processExecutables
 
-    Remove-LenovoAIServices
+    Remove-LenovoAIServices -InstallPaths $installPaths
     Remove-LenovoAINowAppxPackages
     Remove-LenovoAINowAppxRepositoryStubs
 
