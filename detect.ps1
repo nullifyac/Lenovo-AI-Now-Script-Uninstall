@@ -68,6 +68,7 @@ $binaryMatches = @()
 $processMatches = @()
 $serviceMatches = @()
 $appxMatches = @()
+$shellExtensionMatches = @()
 
 $targetNamePattern = '*Lenovo AI Now*'
 $registryRoots = @(
@@ -164,8 +165,8 @@ try {
         $serviceName = $svc.Name
         $pathName = $svc.PathName
 
-        $nameMatch = ($displayName -and ($displayName -like '*Lenovo AI*')) -or
-                     ($serviceName -and ($serviceName -like 'LenovoAI*'))
+        $nameMatch = ($displayName -and ($displayName -match '(?i)\bLenovo\s+AI\s+Now\b|\bAINow\b')) -or
+                     ($serviceName -and ($serviceName -match '(?i)AINow|Lenovo.*AI.*Now'))
 
         $pathMatch = $false
         if (-not $nameMatch -and $pathName) {
@@ -198,14 +199,17 @@ try {
 Write-Host "Checking for AppX/MSIX packages..."
 try {
     $installed = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like '*AINow*' -or $_.Name -like '*LenovoAI*' })
+        Where-Object { $_.Name -match '(?i)AINow|Lenovo.*AI.*Now' })
     foreach ($pkg in $installed) {
         Write-Host "Detected AppX package: $($pkg.Name) $($pkg.Version)"
         $appxMatches += $pkg.PackageFullName
     }
     try {
         $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
-            Where-Object { $_.PackageName -like '*AINow*' -or $_.DisplayName -like '*Lenovo*AI*' })
+            Where-Object {
+                $_.PackageName -match '(?i)AINow|Lenovo.*AI.*Now' -or
+                $_.DisplayName -match '(?i)\bLenovo\s+AI\s+Now\b|\bAINow\b'
+            })
         foreach ($pkg in $provisioned) {
             Write-Host "Detected provisioned AppX package: $($pkg.PackageName)"
             $appxMatches += $pkg.PackageName
@@ -232,7 +236,7 @@ try {
         $repoPath = "$($userKey.PSPath)\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages"
         if (-not (Test-Path -LiteralPath $repoPath)) { continue }
         $stubs = Get-ChildItem -LiteralPath $repoPath -ErrorAction SilentlyContinue |
-            Where-Object { $_.PSChildName -like '*AINow*' -or $_.PSChildName -like '*LenovoAI*' }
+            Where-Object { $_.PSChildName -match '(?i)AINow|Lenovo.*AI.*Now' }
         foreach ($s in $stubs) {
             Write-Host "Detected orphaned AppX repository stub: $($s.PSChildName) (SID: $($userKey.PSChildName))"
             $appxStubMatches += $s.PSChildName
@@ -248,10 +252,40 @@ foreach ($root in @(
 )) {
     if (-not (Test-Path -LiteralPath $root)) { continue }
     $stubs = Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue |
-        Where-Object { $_.PSChildName -like '*AINow*' -or $_.PSChildName -like '*LenovoAI*' }
+        Where-Object { $_.PSChildName -match '(?i)AINow|Lenovo.*AI.*Now' }
     foreach ($s in $stubs) {
         Write-Host "Detected HKLM AppX stub: $($s.PSChildName) (root: $root)"
         $appxStubMatches += $s.PSChildName
+    }
+}
+
+Write-Host "Checking for shell extension registry traces..."
+$knownShellExtensionKeys = @(
+    'HKLM:\SOFTWARE\Classes\CLSID\{281E645C-1F68-4276-80F6-8476CED89BB1}',
+    'HKLM:\SOFTWARE\Classes\CLSID\{B872E6A0-3D43-48B9-BF55-6952BE5B297A}',
+    'HKLM:\SOFTWARE\Classes\CLSID\{4B48C68B-80D6-40FB-B4D1-63C19130EC75}',
+    'HKLM:\SOFTWARE\Classes\Wow6432Node\CLSID\{281E645C-1F68-4276-80F6-8476CED89BB1}',
+    'HKLM:\SOFTWARE\Classes\Wow6432Node\CLSID\{B872E6A0-3D43-48B9-BF55-6952BE5B297A}',
+    'HKLM:\SOFTWARE\Classes\Wow6432Node\CLSID\{4B48C68B-80D6-40FB-B4D1-63C19130EC75}',
+    'HKLM:\SOFTWARE\Classes\AppID\{5D1C76DE-B933-40AC-B588-6B46EA0A45C9}',
+    'HKLM:\SOFTWARE\Classes\TypeLib\{8EE1DABC-E488-4AB8-8184-817AA4456D51}',
+    'HKLM:\SOFTWARE\Classes\LenovoAINowOverlayIcon.MyLenovoAINowOverlayIcon.1',
+    'HKLM:\SOFTWARE\Classes\LenovoAINowOverlayIcon.MyLenovoAINowOverlayIcon',
+    'HKLM:\SOFTWARE\Classes\*\shellex\ContextMenuHandlers\Lenovo AI Now',
+    'HKLM:\SOFTWARE\Classes\*\shellex\DragDropHandlers\Lenovo AI Now',
+    'HKLM:\SOFTWARE\Classes\Directory\shellex\ContextMenuHandlers\Lenovo AI Now',
+    'HKLM:\SOFTWARE\Classes\Directory\shellex\DragDropHandlers\Lenovo AI Now',
+    'HKLM:\SOFTWARE\Classes\Drive\shellex\ContextMenuHandlers\Lenovo AI Now',
+    'HKLM:\SOFTWARE\Classes\Drive\shellex\DragDropHandlers\Lenovo AI Now',
+    'HKLM:\SOFTWARE\Classes\Folder\shellex\ContextMenuHandlers\Lenovo AI Now',
+    'HKLM:\SOFTWARE\Classes\Folder\shellex\DragDropHandlers\Lenovo AI Now',
+    'HKLM:\SOFTWARE\Classes\lnkfile\shellex\ContextMenuHandlers\Lenovo AI Now',
+    'HKLM:\SOFTWARE\Classes\lnkfile\shellex\DragDropHandlers\Lenovo AI Now'
+)
+foreach ($key in $knownShellExtensionKeys) {
+    if (Test-Path -LiteralPath $key) {
+        Write-Host "Detected shell extension registry trace: $key"
+        $shellExtensionMatches += $key
     }
 }
 
@@ -264,6 +298,7 @@ if ($processMatches.Count -gt 0) { Write-Host "Lenovo AI Now processes are runni
 if ($serviceMatches.Count -gt 0) { Write-Host "Lenovo AI Now services detected."; $shouldRemediate = $true }
 if ($appxMatches.Count -gt 0) { Write-Host "Lenovo AI Now AppX packages detected."; $shouldRemediate = $true }
 if ($appxStubMatches.Count -gt 0) { Write-Host "Orphaned AppX repository stubs detected."; $shouldRemediate = $true }
+if ($shellExtensionMatches.Count -gt 0) { Write-Host "Shell extension registry traces detected."; $shouldRemediate = $true }
 if ($totalFiles -gt $fileThreshold) { Write-Host "File count exceeds threshold ($fileThreshold)."; $shouldRemediate = $true }
 
 if ($shouldRemediate) {
