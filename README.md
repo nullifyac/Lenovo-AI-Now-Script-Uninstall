@@ -35,14 +35,17 @@ Remediation
 
 The remediation flow:
 
-1. Stop and disable Lenovo AI Now services.
-2. Stop Lenovo AI Now processes by install path and executable name.
-3. Remove installed and provisioned AppX/MSIX packages.
-4. Scrub orphaned AppX repository stubs.
-5. Unregister known and discovered Lenovo AI Now shell extensions.
-6. Remove user data, shortcuts, scheduled tasks, registry keys, and Run values.
-7. Remove install directories in-session when possible.
-8. Rename remaining files to `*.tobedeleted`, queue locked files and directories in `PendingFileRenameOperations`, and write a Phase A sentinel when a reboot is required.
+1. Attempt Lenovo's vendor uninstaller with the current typoed silent switch: `SlientUninstall`.
+2. Stop and disable Lenovo AI Now services.
+3. Stop Lenovo AI Now processes by install path and executable name.
+4. Remove installed and provisioned AppX/MSIX packages.
+5. Scrub orphaned AppX repository stubs.
+6. Unregister known and discovered Lenovo AI Now shell extensions.
+7. Remove user data, shortcuts, scheduled tasks, registry keys, and Run values.
+8. Remove install directories in-session when possible.
+9. Rename remaining files to `*.tobedeleted`, queue locked files and directories in `PendingFileRenameOperations`, and write a Phase A sentinel when a reboot is required.
+
+The vendor uninstall is best-effort only. Validation against Lenovo AI Now `1.3.3.912` showed `SlientUninstall` removes the app, uninstall entry, install directory, and AppX package, but can leave shell/COM registry traces behind. The script continues the manual cleanup path so those leftovers are still removed.
 
 Locked shell-extension DLLs such as `AINppShell.dll` and `OverlayIcon.dll` are expected on active desktops. The script queues those files for boot-time deletion instead of killing Explorer or attempting long-running deletion workarounds.
 
